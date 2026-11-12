@@ -1471,12 +1471,12 @@ class App(tk.Tk):
         dom = self.region.get()
         if self.site and nr.site_domain(*self.site_locs[self.site]) != dom:
             self.choose_site(None)
-        self.map.set_domain(dom)
+        if not self.playing:
+            self.fi = None                       # each region opens on its latest frame
         sel = self.by_id.get(self.selected)
         if not sel or sel["domain"] != dom:
             self._select_top()
-            self.map.redraw()
-        self.fi = None
+        self.map.set_domain(dom)
         self._sync_loop()
         self._update_panel()
 

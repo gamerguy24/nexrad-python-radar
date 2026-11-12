@@ -37,7 +37,6 @@ COVER = {"CONUS": (-127.5, -64.5, 21.5, 51.5), "ALASKA": (-180.0, -128.0, 50.0, 
 VIEW = {"CONUS": (-124.8, -66.9, 24.5, 49.4), "ALASKA": (-170.5, -129.5, 51.5, 71.5),
         "HAWAII": (-160.3, -154.8, 18.9, 22.3)}
 GRID_RES_M = {"CONUS": 2000.0, "ALASKA": 3000.0, "HAWAII": 1000.0}
-US_BUFFER_M = 25000.0            # keep echoes this close to the US (coastal waters)
 
 
 def domain_of_state(postal: str) -> str:
@@ -126,7 +125,7 @@ class BaseMap:
     land: Dict[str, Dict[str, List[np.ndarray]]]       # dom -> {"coarse"/"fine": rings}
     counties: Dict[str, List[Tuple[Tuple[float, float, float, float], np.ndarray]]]
     labels: Dict[str, List[Tuple[str, float, float]]]   # dom -> (postal, x, y)
-    mask_rings: Dict[str, List[np.ndarray]]             # US outline incl. Great Lakes
+    mask_rings: Dict[str, List[np.ndarray]]             # other countries' land (hidden)
 
 
 def _ne(name):
@@ -166,16 +165,20 @@ def load_basemap() -> BaseMap:
         if a["postal"] != "DC":
             x, y = project(dom, a["longitude"], a["latitude"])
             labels[dom].append((a["postal"], float(x), float(y)))
-    for rec in _ne("admin_1_states_provinces"):                 # lakes not cut out
-        a = rec.attributes
-        if a["admin"] != "United States of America":
+    import shapely
+    for rec in _ne("admin_0_countries"):                        # other countries' land
+        if rec.attributes.get("ADM0_A3") == "USA":
             continue
-        dom = domain_of_state(a["postal"])
-        for ring in _rings(rec.geometry):
-            x, y = project(dom, ring[:, 0], ring[:, 1])
-            s = _simplify(np.column_stack([x, y]), 1500.0)
-            if len(s) >= 4:
-                mask_rings[dom].append(s)
+        for dom in DOMAINS:
+            w, e, s_, n = COVER[dom]
+            part = shapely.clip_by_rect(rec.geometry, w - 3, s_ - 3, e + 3, n + 3)
+            if part.is_empty:
+                continue
+            for ring in _rings(part):
+                x, y = project(dom, ring[:, 0], ring[:, 1])
+                s = _simplify(np.column_stack([x, y]), 1000.0)
+                if len(s) >= 4:
+                    mask_rings[dom].append(s)
     for rec in _ne("admin_2_counties"):
         a = rec.attributes
         if a.get("ADM0_A3") != "USA":
@@ -190,18 +193,15 @@ def load_basemap() -> BaseMap:
     return BaseMap(land, counties, labels, mask_rings)
 
 
-def us_mask(g: RasterGrid, rings: List[np.ndarray], buffer_m: float = US_BUFFER_M) -> np.ndarray:
-    """Boolean (ny, nx): True inside the US (plus a coastal/border buffer)."""
+def us_mask(g: RasterGrid, foreign_rings: List[np.ndarray]) -> np.ndarray:
+    """Boolean (ny, nx): False over other countries' land, True elsewhere
+    (the US, its coastal waters, the Gulf and the open ocean)."""
     img = Image.new("L", (g.nx, g.ny), 0)
     d = ImageDraw.Draw(img)
-    width = max(1, int(round(2 * buffer_m / g.res)))
-    for r in rings:
+    for r in foreign_rings:
         px = (r[:, 0] - g.x0) / g.res
         py = (g.y1 - r[:, 1]) / g.res
-        if px.max() < -width or px.min() > g.nx + width or py.max() < -width or py.min() > g.ny + width:
+        if px.max() < 0 or px.min() > g.nx or py.max() < 0 or py.min() > g.ny:
             continue
-        pts = list(zip(px.tolist(), py.tolist()))
-        d.polygon(pts, fill=1)
-        if buffer_m > 0:
-            d.line(pts + pts[:1], fill=1, width=width, joint="curve")
-    return np.asarray(img, dtype=bool)
+        d.polygon(list(zip(px.tolist(), py.tolist())), fill=1)
+    return ~np.asarray(img, dtype=bool)
