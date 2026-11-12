@@ -19,14 +19,14 @@ WHAT IT DOES
   5. Attributes everything to its WFO (county warning area), both where the
      cell is now and where it is forecast to be in 55-60 min.
 
-USAGE
-  python storm_tracker.py                    # latest scans, all domains
+USAGE  (runs live and continuously until Ctrl+C)
+  python storm_tracker.py                    # all domains, refresh every 2 min
   python storm_tracker.py --office FFC       # only cells over/into one WFO
-  python storm_tracker.py --loop 6           # re-run every 6 min
-  python storm_tracker.py --demo             # offline synthetic validation
+  python storm_tracker.py --loop 6           # refresh every 6 min instead
   python storm_tracker.py --strokes file.csv --lma lma_dir/
 
-DEPENDENCIES: numpy scipy requests eccodes pillow
+DEPENDENCIES: numpy scipy requests pillow
+  (MRMS GRIB2 is decoded natively; ecCodes is not needed)
 
 IMPORTANT LIMITS (read before operational use)
   * The threat model is an interpretable heuristic, NOT a calibrated or
@@ -53,6 +53,7 @@ import json
 import logging
 import math
 import re
+import struct
 import sys
 import time
 from dataclasses import dataclass, field
@@ -64,10 +65,6 @@ import requests
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 
-try:
-    import eccodes as ec
-except ImportError:  # only needed for live MRMS decoding
-    ec = None
 try:
     from PIL import Image, ImageDraw
 except ImportError:
@@ -182,22 +179,49 @@ def block_reduce(a: np.ndarray, k: int, how: str) -> np.ndarray:
 _TS = re.compile(r"_(\d{8})-(\d{6})\.grib2\.gz$")
 
 
+def _grib_int(b: bytes) -> int:
+    """GRIB2 signed integer (sign-magnitude, not two's complement)."""
+    v = int.from_bytes(b, "big")
+    top = 1 << (8 * len(b) - 1)
+    return -(v & (top - 1)) if v & top else v
+
+
+def _decode_grib2(msg: bytes):
+    """Minimal GRIB2 reader for MRMS: grid template 3.0 (regular lat/lon) with
+    data template 5.41 (PNG packing), the only layout MRMS 2D products use.
+    -> (values (nj, ni) float32, lat1, lon1, di, dj, north_first)."""
+    if msg[:4] != b"GRIB" or msg[7] != 2:
+        raise ValueError("not a GRIB2 message")
+    p, sec = 16, {}
+    while msg[p:p + 4] != b"7777":
+        ln = struct.unpack(">I", msg[p:p + 4])[0]
+        sec[msg[p + 4]] = msg[p:p + ln]
+        p += ln
+    s3, s5, s7 = sec[3], sec[5], sec[7]
+    gdt, drt = struct.unpack(">H", s3[12:14])[0], struct.unpack(">H", s5[9:11])[0]
+    if gdt != 0 or drt != 41:
+        raise ValueError(f"unsupported GRIB2 templates 3.{gdt} / 5.{drt}")
+    ni, nj = struct.unpack(">II", s3[30:38])
+    lat1, lon1 = _grib_int(s3[46:50]) * 1e-6, _grib_int(s3[50:54]) * 1e-6
+    di, dj = _grib_int(s3[63:67]) * 1e-6, _grib_int(s3[67:71]) * 1e-6
+    north_first = not (s3[71] & 0x40)
+    ref = struct.unpack(">f", s5[11:15])[0]
+    e, d = _grib_int(s5[15:17]), _grib_int(s5[17:19])
+    x = np.asarray(Image.open(io.BytesIO(s7[5:])))
+    if x.ndim == 3:                                  # 24/32-bit packed as RGB(A)
+        x = x.astype(np.uint32)
+        x = np.bitwise_or.reduce([x[..., i] << (8 * (x.shape[2] - 1 - i))
+                                  for i in range(x.shape[2])])
+    v = ((ref + x.astype(np.float32) * np.float32(2.0 ** e)) / np.float32(10.0 ** d))
+    return v.reshape(nj, ni), lat1, lon1, di, dj, north_first
+
+
 def decode_grib2_gz(raw: bytes, kind: str, how: str, k: int):
     """Decode one MRMS GRIB2 (gzip) message -> (coarsened float16, Grid)."""
-    if ec is None:
-        raise RuntimeError("eccodes not installed (pip install eccodes)")
-    msg = gzip.decompress(raw)
-    h = ec.codes_new_from_message(msg)
-    try:
-        ni, nj = ec.codes_get(h, "Ni"), ec.codes_get(h, "Nj")
-        lat1 = ec.codes_get(h, "latitudeOfFirstGridPointInDegrees")
-        lon1 = ec.codes_get(h, "longitudeOfFirstGridPointInDegrees")
-        di = ec.codes_get(h, "iDirectionIncrementInDegrees")
-        dj = ec.codes_get(h, "jDirectionIncrementInDegrees")
-        north_first = not ec.codes_get(h, "jScansPositively")
-        v = ec.codes_get_values(h).astype(np.float32).reshape(nj, ni)
-    finally:
-        ec.codes_release(h)
+    if Image is None:
+        raise RuntimeError("pillow required to decode MRMS (pip install pillow)")
+    v, lat1, lon1, di, dj, north_first = _decode_grib2(gzip.decompress(raw))
+    nj, ni = v.shape
     if not north_first:
         v = v[::-1]
         lat1 = lat1 + (nj - 1) * dj
@@ -460,9 +484,14 @@ class WfoCatalog:
         cache_dir.mkdir(parents=True, exist_ok=True)
         p = cache_dir / "cwa_boundary.geojson"
         if not p.exists() or time.time() - p.stat().st_mtime > 30 * 86400:
-            r = requests.get(WFO_URL, timeout=90)
-            r.raise_for_status()
-            p.write_bytes(r.content)
+            try:
+                r = requests.get(WFO_URL, timeout=90)
+                r.raise_for_status()
+                p.write_bytes(r.content)
+            except requests.RequestException:
+                if not p.exists():
+                    raise
+                log.warning("WFO boundary refresh failed; using cached copy")
         return cls(json.loads(p.read_text()))
 
     def raster(self, grid: Grid) -> np.ndarray:
@@ -871,9 +900,9 @@ def lightning_forecast(tr: Track, cfg: Config, wfos: Optional[WfoCatalog],
     dcore = _trend(tr, "cref", span_min=30.0)            # dBZ per minute
     if dcore < -0.02 and o.cref > 30.0:
         t_death = (o.cref - 35.0) / (-dcore)             # minutes to 35 dBZ core
-        if t_death < hi + 30.0:
-            surv = 0.5 * (math.exp(-(lo - t_death) / 15.0)
-                          + math.exp(-(hi - t_death) / 15.0))
+        if t_death < hi + 30.0:                          # alive (1.0) until t_death
+            surv = 0.5 * (math.exp(-max(lo - t_death, 0.0) / 15.0)
+                          + math.exp(-max(hi - t_death, 0.0) / 15.0))
         else:
             surv = 1.0
     else:
@@ -1212,101 +1241,6 @@ def print_report(rows, summary, pipe: StormPipeline, top=15):
 
 
 # --------------------------------------------------------------------------
-# Offline demo / self-test with known ground truth
-# --------------------------------------------------------------------------
-class DemoSource(FrameSource):
-    """Three synthetic storms on a 0.02 deg grid with known motion:
-       A: mature, moving ENE 18 m/s, hail ramping 15 -> 45 mm, already electrified
-       B: young, moving E 12 m/s, growing; first flash only AFTER issue time (t>135)
-       C: decaying, moving NE 10 m/s, hail decreasing
-    """
-    T0 = dt.datetime(2026, 5, 1, 18, 0, tzinfo=UTC)
-    grid = Grid(40.0, -100.0, 0.02, 0.02, 400, 600)      # 40N..32N, 100W..88W
-
-    def __init__(self, now_min=120.0, step=6.0, history=90.0):
-        self.now_min, self.step, self.history = now_min, step, history
-
-    def storms(self, tmin):
-        kmlon = 111.32 * math.cos(math.radians(36.0))
-
-        def pos(x0, y0, vx, vy):      # km east/north of grid NW corner
-            return x0 + vx * 0.06 * tmin, y0 + vy * 0.06 * tmin
-        A = pos(150, -120, 17.1, 5.5)
-        B = pos(250, -260, 12.0, 0.5)
-        C = pos(500, -200, 7.0, 7.0)
-        return [
-            dict(name="A", xy=A, s=11, cref=55, z10=48, mesh=15 + 30 * min(tmin, 90) / 90,
-                 ltg=1.2 if tmin > 20 else 0.0),
-            dict(name="B", xy=B, s=8, cref=min(36 + 0.22 * tmin, 58),
-                 z10=min(10 + 0.38 * tmin, 46), mesh=max(0.0, 0.17 * tmin - 12),
-                 ltg=0.8 if tmin > 135 else 0.0),
-            dict(name="C", xy=C, s=10, cref=max(52 - 0.2 * tmin, 38),
-                 z10=max(44 - 0.2 * tmin, 20), mesh=max(30 - 0.25 * tmin, 0),
-                 ltg=0.3 * max(0.0, 1 - max(tmin - 60, 0) / 90.0)),
-        ]
-
-    def timeline(self, domain):
-        n = int(self.history // self.step) + 1
-        return [self.T0 + dt.timedelta(minutes=self.now_min - i * self.step) for i in range(n)]
-
-    def frame(self, domain, t):
-        tmin = (t - self.T0).total_seconds() / 60.0
-        g = self.grid
-        rr, cc = np.mgrid[0:g.ny, 0:g.nx]
-        lat, lon = g.latlon(rr, cc)
-        kmlon = 111.32 * math.cos(math.radians(36.0))
-        X = (lon - g.lon0) * kmlon
-        Y = (lat - g.lat0) * KM_LAT
-        out = {k: np.full((g.ny, g.nx), -30.0, np.float32) for k in ("cref", "z10")}
-        for k in ("mesh", "nldn", "jump", "prob"):
-            out[k] = np.zeros((g.ny, g.nx), np.float32)
-        for s in self.storms(tmin):
-            d2 = (X - s["xy"][0]) ** 2 + (Y - s["xy"][1]) ** 2
-            f = np.exp(-d2 / (2 * s["s"] ** 2))
-            out["cref"] = np.maximum(out["cref"], -30 + (s["cref"] + 30) * f)
-            out["z10"] = np.maximum(out["z10"], -30 + (s["z10"] + 30) * f)
-            out["mesh"] = np.maximum(out["mesh"], s["mesh"] * (f > 0.35))
-            out["nldn"] += (s["ltg"] * 0.02) * (f > 0.3)
-            out["prob"] = np.maximum(out["prob"],
-                                     np.clip((s["z10"] - 25.0) * 4.0, 0.0, 95.0) * (f > 0.3))
-        out["nldn"] = out["nldn"].astype(np.float32)
-        return {k: v.astype(np.float16) for k, v in out.items()}, g
-
-
-def run_demo(cfg: Config):
-    print("DEMO: synthetic storms with known truth; forecast issued at t=+120 min,")
-    print("verified against the true positions at t=+175..180 min.\n")
-    wfo_geo = {"features": [
-        {"properties": {"cwa": "AAA", "citystate": "Demo West"}, "geometry": {
-            "type": "Polygon", "coordinates": [[[-100, 32], [-94, 32], [-94, 40], [-100, 40], [-100, 32]]]}},
-        {"properties": {"cwa": "BBB", "citystate": "Demo East"}, "geometry": {
-            "type": "Polygon", "coordinates": [[[-94, 32], [-88, 32], [-88, 40], [-94, 40], [-94, 32]]]}}]}
-    cfg.domains = ("CONUS",)
-    cfg.lead_min = (55.0, 60.0)
-    src = DemoSource(now_min=120.0, step=cfg.step_min, history=cfg.history_min)
-    pipe = StormPipeline(cfg, src, WfoCatalog(wfo_geo))
-    rows = pipe.run()
-    summary = pipe.wfo_summary(rows)
-    print_report(rows, summary, pipe)
-    # verification against ground truth
-    print("\nPosition verification (forecast 57.5-min centre vs truth at t+177.5):")
-    truth = {s["name"]: s["xy"] for s in src.storms(177.5)}
-    g = src.grid
-    kmlon = 111.32 * math.cos(math.radians(36.0))
-    for r in rows:
-        fx = (r["lightning"]["forecast_lon_57"] - g.lon0) * kmlon
-        fy = (r["lightning"]["forecast_lat_57"] - g.lat0) * KM_LAT
-        best = min(truth.items(), key=lambda kv: math.hypot(kv[1][0] - fx, kv[1][1] - fy))
-        err = math.hypot(best[1][0] - fx, best[1][1] - fy)
-        print(f"  track {r['track_id']:5s} -> storm {best[0]}  error {err:5.1f} km  "
-              f"(model sigma {r['lightning']['pos_sigma_km']} km, "
-              f"speed {r['speed_ms']} m/s, heading {r['heading_deg']} deg)")
-    d = write_outputs(rows, summary, pipe, cfg.out_dir / "demo")
-    print(f"\nWrote products to {d}")
-    return rows
-
-
-# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None):
@@ -1321,8 +1255,8 @@ def main(argv=None):
     ap.add_argument("--cache", default="mrms_cache")
     ap.add_argument("--strokes", help="CSV of lightning strokes/flashes (time,lat,lon)")
     ap.add_argument("--lma", help="directory of LMA .dat/.dat.gz files")
-    ap.add_argument("--loop", type=float, metavar="MIN", help="repeat every MIN minutes")
-    ap.add_argument("--demo", action="store_true", help="offline synthetic validation")
+    ap.add_argument("--loop", type=float, default=2.0, metavar="MIN",
+                    help="refresh every MIN minutes (default 2, the MRMS update rate)")
     ap.add_argument("--top", type=int, default=15)
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args(argv)
@@ -1332,10 +1266,6 @@ def main(argv=None):
                  cache_dir=Path(a.cache), out_dir=Path(a.out), office=a.office,
                  domains=DOMAINS if a.domains == "all"
                  else tuple(x.strip().upper() for x in a.domains.split(",")))
-    if a.demo:
-        cfg.coarsen = 1
-        run_demo(cfg)
-        return 0
 
     points = []
     if a.strokes:
@@ -1345,25 +1275,34 @@ def main(argv=None):
             points += read_lma_dat(p)
     if points:
         print(f"Loaded {len(points)} supplementary lightning points")
-    wfos = WfoCatalog.fetch(cfg.cache_dir)
-    print(f"Loaded {len(wfos.codes)} NWS office boundaries")
-
-    while True:
-        t0 = time.time()
-        src = LiveSource(cfg, points)
-        pipe = StormPipeline(cfg, src, wfos)
-        rows = pipe.run()
-        summary = pipe.wfo_summary(rows)
-        if pipe.latest:
-            d = write_outputs(rows, summary, pipe, cfg.out_dir)
-            print_report(rows, summary, pipe, a.top)
-            print(f"\nProducts written to {d}  ({time.time() - t0:.0f}s)")
-        else:
-            print("No MRMS data retrieved.", file=sys.stderr)
-        src.f.prune()
-        if not a.loop:
-            return 0
-        time.sleep(max(5.0, a.loop * 60 - (time.time() - t0)))
+    wfos = None
+    print(f"Live mode: refreshing every {a.loop:g} min (Ctrl+C to stop)")
+    try:
+        while True:
+            t0 = time.time()
+            try:                      # a network/data hiccup must not stop the live loop
+                if wfos is None:
+                    wfos = WfoCatalog.fetch(cfg.cache_dir)
+                    print(f"Loaded {len(wfos.codes)} NWS office boundaries")
+                src = LiveSource(cfg, points)
+                pipe = StormPipeline(cfg, src, wfos)
+                rows = pipe.run()
+                summary = pipe.wfo_summary(rows)
+                if pipe.latest:
+                    d = write_outputs(rows, summary, pipe, cfg.out_dir)
+                    print(f"\n===== {dt.datetime.now(UTC):%Y-%m-%d %H:%M:%SZ} =====")
+                    print_report(rows, summary, pipe, a.top)
+                    print(f"\nProducts written to {d}  ({time.time() - t0:.0f}s)")
+                else:
+                    print("No MRMS data retrieved; will retry.", file=sys.stderr)
+                src.f.prune()
+            except Exception as e:
+                log.exception("live update failed")
+                print(f"Update failed ({e}); retrying next cycle.", file=sys.stderr)
+            time.sleep(max(5.0, a.loop * 60 - (time.time() - t0)))
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
 
 if __name__ == "__main__":
