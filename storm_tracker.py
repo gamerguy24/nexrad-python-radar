@@ -42,6 +42,12 @@ IMPORTANT LIMITS (read before operational use)
 """
 from __future__ import annotations
 
+import os
+
+# keep numpy/scipy's OpenBLAS from reserving memory for every CPU thread (unused here)
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
 import argparse
 import concurrent.futures as cf
 import csv
@@ -209,10 +215,16 @@ def _decode_grib2(msg: bytes):
     e, d = _grib_int(s5[15:17]), _grib_int(s5[17:19])
     x = np.asarray(Image.open(io.BytesIO(s7[5:])))
     if x.ndim == 3:                                  # 24/32-bit packed as RGB(A)
-        x = x.astype(np.uint32)
-        x = np.bitwise_or.reduce([x[..., i] << (8 * (x.shape[2] - 1 - i))
-                                  for i in range(x.shape[2])])
-    v = ((ref + x.astype(np.float32) * np.float32(2.0 ** e)) / np.float32(10.0 ** d))
+        packed = x[..., 0].astype(np.uint32)         # build in place: CONUS grids are
+        for i in range(1, x.shape[2]):               # 24.5M cells, temporaries add up
+            packed <<= 8
+            packed |= x[..., i]
+        x = packed
+    v = x.astype(np.float32)
+    del x
+    v *= np.float32(2.0 ** e)
+    v += np.float32(ref)
+    v /= np.float32(10.0 ** d)
     return v.reshape(nj, ni), lat1, lon1, di, dj, north_first
 
 

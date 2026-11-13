@@ -153,18 +153,51 @@ def mosaic(scans: List[Level3Scan], g: um.RasterGrid) -> np.ndarray:
 
 
 class SiteRenderer:
-    """Caches one radar's polar geometry on its own fine grid."""
+    """Caches one radar's geometry on its own grid (sized for a product's range)
+    and draws any Level III image product (level3.Level3) onto it."""
 
-    def __init__(self, domain: str, lat: float, lon: float, product: str):
-        rng_km = 460.0 if product == "refl" else 300.0
-        res = 500.0 if product == "refl" else 350.0
-        self.grid = um.site_grid(domain, lon, lat, rng_km, res)
-        glon, glat = um.grid_lonlat(self.grid)
+    MAX_PX = 1800                                     # grid is at most this many pixels across
+
+    def __init__(self, domain: str, lat: float, lon: float, range_km: float, res_km: float):
+        self.range_km = range_km
+        res_m = max(res_km * 1000.0, range_km * 2080.0 / self.MAX_PX)
+        self.grid = um.site_grid(domain, lon, lat, range_km, res_m)
+        glon, glat = um.grid_lonlat_nocache(self.grid)
         self.az, self.rng = _polar_geometry(glon, glat, lon, lat)
-        self.rng[self.rng > rng_km] = 1e5            # beyond range -> no data
+        del glon, glat
+        self.rng[self.rng > range_km] = 1e5            # beyond range -> no data
+        self._dxdy = None
 
-    def render(self, sc: Level3Scan) -> np.ndarray:
-        return sample(sc, self.az, self.rng)
+    def dxdy(self):
+        """km east / north of the radar per pixel (raster products only, made on demand)."""
+        if self._dxdy is None:
+            a = np.radians(self.az)
+            self._dxdy = ((self.rng * np.sin(a)).astype(np.float32),
+                          (self.rng * np.cos(a)).astype(np.float32))
+        return self._dxdy
+
+    @staticmethod
+    def key_for(d) -> Tuple[float, float]:
+        """(range, resolution) a renderer needs for a decoded product."""
+        res = d.cell_km if d.cell_km else d.bin_km
+        return round(d.range_km, 1), max(res, 0.25)
+
+    def render(self, d) -> np.ndarray:
+        if d.cell_km:                                   # raster, centred on the radar
+            nr_, nc = d.codes.shape
+            dx, dy = self.dxdy()
+            col = np.floor((dx + nc * d.cell_km / 2) / d.cell_km).astype(np.int32)
+            row = np.floor((nr_ * d.cell_km / 2 - dy) / d.cell_km).astype(np.int32)
+            ok = (row >= 0) & (row < nr_) & (col >= 0) & (col < nc) & (self.rng < 1e4)
+            out = np.zeros(self.az.shape, np.uint8)
+            out[ok] = d.codes[row[ok], col[ok]]
+            return out
+        b = (self.rng / d.bin_km).astype(np.int32) - d.first_bin
+        ri = _radial_index(d, self.az)
+        ok = (b >= 0) & (b < d.codes.shape[1]) & (ri >= 0)
+        out = np.zeros(self.az.shape, np.uint8)
+        out[ok] = d.codes[ri[ok], b[ok]]
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -226,6 +259,55 @@ class NexradFeeder:
             log.debug("radar %s %s failed: %s", site, fn, e)
             self._raw.pop(key, None)
             return None
+
+    # ---- any product folder (single-site viewing) ----
+    def list_folder(self, site: str, folder: str) -> List[Tuple[dt.datetime, str]]:
+        """[(file time UTC, file name)] oldest first; [] if the site lacks the product."""
+        try:
+            r = self.sess.get(f"{TGFTP_RADAR}{folder}/SI.{site}/", timeout=30)
+            if r.status_code != 200:
+                return []
+        except requests.RequestException:
+            return []
+        out = []
+        for fn, ts in _LIST_RE.findall(r.text):
+            try:
+                out.append((dt.datetime.strptime(ts, "%d-%b-%Y %H:%M").replace(tzinfo=UTC), fn))
+            except ValueError:
+                pass
+        out.sort()
+        return out
+
+    def fetch(self, site: str, folder: str, fn: str = "sn.last") -> Optional[bytes]:
+        try:
+            r = self.sess.get(f"{TGFTP_RADAR}{folder}/SI.{site}/{fn}", timeout=30)
+            return r.content if r.status_code == 200 else None
+        except requests.RequestException:
+            return None
+
+    def tdwr_sites(self) -> Dict[str, Tuple[float, float]]:
+        """{site: (lat, lon)} of the TDWR airport radars in the 50 states."""
+        try:
+            r = self.sess.get(TGFTP_RADAR + "DS.180z0/", timeout=30)
+            r.raise_for_status()
+        except requests.RequestException:
+            return {}
+        sites = sorted(set(re.findall(r'href="SI\.(t\w{3})/?"', r.text)))
+
+        def loc(s):
+            try:                                   # the header is all we need
+                rr = self.sess.get(f"{TGFTP_RADAR}DS.180z0/SI.{s}/sn.last", timeout=30,
+                                   headers={"Range": "bytes=0-400"})
+                raw = rr.content
+                i = raw.find(b"\r\r\n")
+                i = raw.find(b"\r\r\n", i + 3) + 3
+                lat, lon = struct.unpack(">ii", raw[i + 20:i + 28])
+                return s, (lat / 1000.0, lon / 1000.0)
+            except Exception:
+                return s, None
+        with cf.ThreadPoolExecutor(self.workers) as ex:
+            got = dict(ex.map(loc, sites))
+        return {s: v for s, v in got.items() if v and site_domain(*v)}
 
     def prune(self, before: dt.datetime):
         for k in [k for k in self._raw if k[3] < before]:

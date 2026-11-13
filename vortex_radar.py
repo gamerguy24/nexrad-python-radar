@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """
-storm_tracker_gui.py -- desktop radar viewer + storm tracker for the 50 US states.
+Vortex Radar -- desktop radar viewer + storm tracker for the 50 US states.
 
 Two data sources, each with its own on/off switch:
-  * NEXRAD radar sites  (NWS tgftp, see nexrad_radar.py): a mosaic of every
-    US radar, or pick one site to see its own reflectivity or velocity
+  * NEXRAD radar sites  (NWS tgftp, see nexrad_radar.py / level3.py): a mosaic of
+    every US radar, or pick one radar (NEXRAD or TDWR) to see any of its Level III
+    products -- reflectivity, velocity, storm-relative velocity, dual-pol, echo
+    tops, VIL, precipitation -- with storm-track, hail, mesocyclone, TVS and
+    melting-layer overlays and the VAD wind profile
   * MRMS                (NOAA MRMS, see storm_tracker.py): the MRMS composite
     reflectivity layer and the tracked storm cells with their 55-60 min
     forecast paths, lightning threat and hail
@@ -16,13 +19,22 @@ slider.  Colour tables: built-in ones, or load any GRLevelX / GR2Analyst
 .pal file (copied into color_tables/, which is loaded at start-up).
 
 USAGE
-  python storm_tracker_gui.py
-  python storm_tracker_gui.py --office FFC --loop 4
+  python vortex_radar.py
+  python vortex_radar.py --office FFC --loop 4
 
 Keys: space = play / pause, left / right = step, Home = latest frame.
 Products are still written to storm_out/ exactly as the command-line tool does.
 """
 from __future__ import annotations
+
+import os
+
+# numpy's and scipy's OpenBLAS reserve ~30 MB per CPU thread each as soon as they are
+# imported (about 1 GB per process on a 16-thread PC, three processes here).  Nothing
+# in this program uses multi-threaded linear algebra, so keep them to one thread.
+# Must run before numpy is imported; the worker processes inherit it.
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 import argparse
 import concurrent.futures as cf
@@ -50,20 +62,22 @@ import shapely
 from PIL import Image, ImageTk
 
 import color_tables as ct
+import level3 as l3
 import nexrad_radar as nr
 import storm_tracker as st
 import us_map as um
 
 log = logging.getLogger("storm_tracker.gui")
 UTC = dt.timezone.utc
-APP_VERSION = "1.0.0"     # bump this, rebuild (build.bat) and publish a GitHub release
+APP_NAME = "Vortex Radar"
+APP_VERSION = "1.1.0"     # bump this, rebuild (build.bat) and publish a GitHub release
 GITHUB_REPO = "gamerguy24/nexrad-python-radar"
 FROZEN = getattr(sys, "frozen", False)      # running as the PyInstaller exe
 
 
 def _data_dir() -> Path:
     """Where downloads, outputs, colour tables and the log live: next to the exe
-    (or this script); %LOCALAPPDATA%\\StormTracker if that folder is read-only."""
+    (or this script); %LOCALAPPDATA%\\VortexRadar if that folder is read-only."""
     here = Path(sys.executable if FROZEN else __file__).resolve().parent
     try:
         probe = here / ".write_test"
@@ -71,7 +85,7 @@ def _data_dir() -> Path:
         probe.unlink()
         return here
     except OSError:
-        alt = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "StormTracker"
+        alt = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "VortexRadar"
         alt.mkdir(parents=True, exist_ok=True)
         return alt
 
@@ -84,7 +98,7 @@ def _setup_logging():
     """The exe has no console, so log to a file there; the script logs to the terminal."""
     kw = dict(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
     if FROZEN:
-        kw["filename"] = str(DATA_DIR / "storm_tracker.log")
+        kw["filename"] = str(DATA_DIR / "vortex_radar.log")
     logging.basicConfig(**kw)
 
 
@@ -122,6 +136,31 @@ def fmt_time(t):
     return f"{t:%H:%M} UTC  ({t.astimezone():%I:%M %p} local)"
 
 
+def fmt_value(v, fam):
+    """Readout text for a data value of a colour-table family."""
+    if fam == "BR":
+        return f"{v:.1f} dBZ"
+    if fam in ("BV", "SW"):
+        return f"{v * 1.943844:.0f} kts ({v:.1f} m/s)"
+    if fam == "ZDR":
+        return f"{v:.2f} dB"
+    if fam == "CC":
+        return f"{v:.3f}"
+    if fam == "KDP":
+        return f"{v:.2f} deg/km"
+    if fam == "HC":
+        return l3.HC_CLASSES.get(int(round(v)), ("?", "unknown"))[1]
+    if fam == "ET":
+        return f"{v:.0f} kft"
+    if fam == "VIL":
+        return f"{v:.1f} kg/m\u00b2"
+    if fam == "PRECIP":
+        return f"{v:.2f} in"
+    if fam == "DIFF":
+        return f"{v:+.2f} in"
+    return f"{v:g}"
+
+
 # --------------------------------------------------------------------------
 # Background workers (separate processes, so number crunching never stalls
 # the window).  Each idles while its data source is switched off.
@@ -150,7 +189,7 @@ def _mrms_codes(arr, mg: st.Grid, g: um.RasterGrid, cache) -> np.ndarray:
     return codes
 
 
-def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, enabled):
+def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, enabled, refl_on):
     _setup_logging()
     wfos = None
     grids = {d: um.domain_grid(d) for d in cfg.domains}
@@ -178,7 +217,7 @@ def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, en
                     "rows": rows, "summary": summary, "status": dict(pipe.status),
                     "newest": max(pipe.latest.values()), "report": buf.getvalue(),
                     "out_dir": str(out_dir), "secs": time.time() - t0}))
-                for dom in pipe.latest:                     # MRMS reflectivity loop
+                for dom in (pipe.latest if refl_on.is_set() else ()):   # MRMS reflectivity loop
                     times = sorted(src.f.timeline(dom))[-MRMS_FRAMES:]
                     for t in reversed(times):
                         if t in sent[dom]:
@@ -189,6 +228,8 @@ def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, en
                                                                        idx_cache))))
                     sent[dom] = set(times)
                     q.put(("mrms_keep", (dom, times)))
+                if not refl_on.is_set():                     # layer off: window keeps nothing
+                    sent = {d: set() for d in cfg.domains}
             else:
                 q.put(("error", "No MRMS data retrieved; will retry."))
             src.f.prune()
@@ -206,6 +247,7 @@ def run_nexrad_worker(loop_min: float, q, wake, stop, enabled):
     feeder = nr.NexradFeeder()
     grids = {d: um.domain_grid(d) for d in um.DOMAINS}
     have = set()
+    tdwr_sent = False
     while not stop.is_set():
         if not _wait_enabled(enabled, stop, q, "nexrad_off"):
             break
@@ -218,6 +260,11 @@ def run_nexrad_worker(loop_min: float, q, wake, stop, enabled):
             q.put(("radar_status", f"Radar sites: downloading {len(todo) + 1} frames..."))
             hist, locs = feeder.history([None] + todo, max_gap_min=11.0)
             q.put(("sites", locs))
+            if not tdwr_sent:
+                td = feeder.tdwr_sites()
+                if td:
+                    q.put(("tdwr_sites", td))
+                    tdwr_sent = True
             for ft in [None] + todo:                       # newest first: map fills quickly
                 scans = hist.get(ft) or []
                 if not scans:
@@ -244,7 +291,8 @@ def run_nexrad_worker(loop_min: float, q, wake, stop, enabled):
 
 
 class SiteLoader(threading.Thread):
-    """Downloads and renders one radar site's recent scans (in the GUI process)."""
+    """Downloads and renders one radar site's recent scans of any Level III product,
+    plus its overlay products (storm tracks, hail, ...).  Runs in the GUI process."""
 
     def __init__(self, out: queue.Queue):
         super().__init__(daemon=True)
@@ -255,8 +303,18 @@ class SiteLoader(threading.Thread):
         self.frames = {}
 
     def request(self, req):
+        """req = (site, product key, tilt index, domain, lat, lon) or None."""
         self.req = req
         self.wake.set()
+
+    def _renderer(self, site, dom, lat, lon, d):
+        key = (site, dom) + nr.SiteRenderer.key_for(d)
+        r = self.rend.get(key)
+        if r is None:
+            if len(self.rend) >= 2:
+                self.rend.clear()
+            r = self.rend[key] = nr.SiteRenderer(dom, lat, lon, *nr.SiteRenderer.key_for(d))
+        return r
 
     def run(self):
         while True:
@@ -265,33 +323,161 @@ class SiteLoader(threading.Thread):
             req = self.req
             if req is None:
                 continue
-            site, prod, dom, lat, lon = req
+            site, key, tilt, dom, lat, lon = req
+            prod = l3.BY_KEY[key]
+            folder = prod.tilts[min(tilt, len(prod.tilts) - 1)][1]
             try:
-                self.out.put(("site_status", f"Radar site {site.upper()}: loading "
-                                             f"{nr.PRODUCTS[prod][3].lower()}..."))
-                cut = dt.datetime.now(UTC) - dt.timedelta(minutes=80)
-                lst = [x for x in self.feeder.listing(site, prod) if x[0] >= cut][-SITE_FRAMES:]
-                if (site, prod) not in self.rend:
-                    if len(self.rend) > 3:
-                        self.rend.clear()
-                    self.rend[(site, prod)] = nr.SiteRenderer(dom, lat, lon, prod)
-                r = self.rend[(site, prod)]
-                keys = [(site, prod, fn, ft) for ft, fn in lst]
+                self.out.put(("site_status", f"Radar site {site.upper()}: loading {prod.key} "
+                                             f"{prod.name.lower()}..."))
+                now = dt.datetime.now(UTC)
+                full = self.feeder.list_folder(site, folder)
+                lst = [x for x in full if x[0] >= now - dt.timedelta(minutes=80)][-SITE_FRAMES:]
+                if not lst and full and now - full[-1][0] < dt.timedelta(hours=26):
+                    lst = full[-1:]                       # slow products (e.g. 24-h totals)
+                stale = full[-1][0] if full and not lst else None
+                keys = [(site, folder, fn, ft) for ft, fn in lst]
                 todo = [k for k in keys if k not in self.frames]
                 with cf.ThreadPoolExecutor(8) as ex:
-                    scans = list(ex.map(lambda k: self.feeder.scan(*k), todo))
-                for k, sc in zip(todo, scans):
-                    if sc is not None:
-                        self.frames[k] = (sc.time, r.render(sc))
-                self.frames = {k: v for k, v in self.frames.items() if k in set(keys)}
-                self.feeder._raw.clear()
+                    raws = list(ex.map(lambda k: self.feeder.fetch(k[0], k[1], k[2]), todo))
+                for k, raw in zip(todo, raws):
+                    if raw is None:
+                        continue
+                    try:
+                        d = l3.decode(raw, prod)
+                    except Exception:
+                        log.debug("decode %s failed", k, exc_info=True)
+                        continue
+                    if d.codes is None:                   # e.g. a "no accumulation" product
+                        self.frames[k] = None
+                        continue
+                    r = self._renderer(site, dom, lat, lon, d)
+                    self.frames[k] = (d.time, r.render(d), d.values, d.rf_code, d.elev, r.grid)
+                keep = set(keys)
+                self.frames = {k: v for k, v in self.frames.items() if k in keep}
                 if self.req != req:
                     continue
-                frames = sorted({v[0]: v[1] for v in self.frames.values()}.items())
-                self.out.put(("site_frames", {"req": req, "grid": r.grid, "frames": frames}))
+                frames = sorted({v[0]: v for v in self.frames.values() if v}.values(),
+                                key=lambda v: v[0])
+                self.out.put(("site_frames", {"req": req, "frames": frames, "listed": len(lst),
+                                              "stale": stale}))
+                if not prod.tdwr:                         # overlay products (NEXRAD only)
+                    f0 = prod.tilts[0][1]
+                    diff = [b for a, b in zip(f0, folder) if a != b]
+                    sfx = diff[0] if diff else "0"
+                    ovs = {}
+                    for ok, (_, ofolder) in l3.OVERLAYS.items():
+                        raw = self.feeder.fetch(site, ofolder.format(t=sfx))
+                        if raw:
+                            try:
+                                d = l3.decode(raw)
+                                ovs[ok] = (d.time, d.features)
+                            except Exception:
+                                log.debug("overlay %s failed", ok, exc_info=True)
+                    if self.req == req:
+                        self.out.put(("site_overlays", {"site": site, "data": ovs}))
             except Exception as e:
                 log.exception("site load failed")
                 self.out.put(("site_error", f"{site.upper()}: {e}"))
+
+
+class VwpWindow(tk.Toplevel):
+    """VAD wind profile (product 48), drawn the way the radar product lays it out."""
+
+    COLORS = {0: "#8c9fb1", 1: "#46d246", 2: "#00b4ff", 3: "#f0e040", 4: "#ff5050", 5: "#ff50ff"}
+
+    def __init__(self, app, site):
+        super().__init__(app)
+        self.title(f"{site.upper()} VAD Wind Profile")
+        self.configure(bg=BG)
+        self.geometry("760x640")
+        self.site = site
+        self.cv = tk.Canvas(self, bg="#0a1017", highlightthickness=0)
+        self.cv.pack(fill="both", expand=True)
+        self.cv.create_text(20, 20, anchor="nw", fill=MUTED, text="Loading wind profile...",
+                            font=("Segoe UI", 11))
+        self.graphic = None
+        self.cv.bind("<Configure>", lambda e: self.draw())
+        self._result = None
+        threading.Thread(target=self._load, daemon=True).start()
+        self.after(200, self._check)
+
+    def _load(self):
+        try:
+            raw = nr.NexradFeeder(workers=1).fetch(self.site, l3.VWP_FOLDER)
+            g = l3.decode(raw).graphic if raw else None
+            msg = None if g else f"No wind profile available for {self.site.upper()}."
+        except Exception as e:
+            g, msg = None, f"Wind profile failed: {e}"
+        self._result = (g, msg)
+
+    def _check(self):                                    # Tk calls stay on the GUI thread
+        if self._result is None:
+            self.after(200, self._check)
+            return
+        g, msg = self._result
+        self.graphic = g
+        if msg:
+            self.cv.delete("all")
+            self.cv.create_text(20, 20, anchor="nw", fill=MUTED, text=msg, font=("Segoe UI", 11))
+        else:
+            self.draw()
+
+    def draw(self):
+        g = self.graphic
+        if not g:
+            return
+        cv = self.cv
+        cv.delete("all")
+        xs = [v for e in g for v in ((e[2], e[4]) if e[0] == "line" else (e[2],))]
+        ys = [v for e in g for v in ((e[3], e[5]) if e[0] == "line" else (e[3],))]
+        x0, x1, y0, y1 = min(xs), max(xs) + 20, min(ys), max(ys) + 10
+        W, H = max(cv.winfo_width(), 200), max(cv.winfo_height(), 200)
+        k = min((W - 20) / max(x1 - x0, 1), (H - 20) / max(y1 - y0, 1))
+
+        def X(x):
+            return 10 + (x - x0) * k
+
+        def Y(y):
+            return 10 + (y - y0) * k
+        for e in g:
+            col = self.COLORS.get(e[1], FG)
+            if e[0] == "line":
+                cv.create_line(X(e[2]), Y(e[3]), X(e[4]), Y(e[5]),
+                               fill="#3a536a" if e[1] not in (1, 2, 3, 4, 5) else col)
+            elif e[0] == "text":
+                cv.create_text(X(e[2]), Y(e[3]), anchor="nw", text=e[4],
+                               fill=FG if e[1] not in self.COLORS else col,
+                               font=("Consolas", max(7, int(8 * k))))
+            elif e[0] == "barb":
+                self._barb(X(e[2]), Y(e[3]), e[4], e[5], col, 22 * k)
+
+    def _barb(self, x, y, direction, speed, col, L):
+        """Standard wind barb; the staff points toward where the wind comes from."""
+        a = math.radians(direction)
+        ux, uy = math.sin(a), -math.cos(a)
+        px, py = -uy, ux                                  # perpendicular side for the barbs
+        ex, ey = x + ux * L, y + uy * L
+        self.cv.create_line(x, y, ex, ey, fill=col, width=1.5)
+        self.cv.create_oval(x - 2, y - 2, x + 2, y + 2, fill=col, outline=col)
+        s = int(round(speed / 5.0)) * 5
+        pos, step, bl = 0.0, L * 0.16, L * 0.45
+        while s >= 50:                                    # pennants
+            bx, by = ex - ux * pos, ey - uy * pos
+            self.cv.create_polygon(bx, by, bx + px * bl, by + py * bl,
+                                   bx - ux * step, by - uy * step, fill=col, outline=col)
+            pos += step * 1.3
+            s -= 50
+        while s >= 10:                                    # full barbs
+            bx, by = ex - ux * pos, ey - uy * pos
+            self.cv.create_line(bx, by, bx + px * bl + ux * step * 0.6,
+                                by + py * bl + uy * step * 0.6, fill=col, width=1.5)
+            pos += step
+            s -= 10
+        if s >= 5:                                        # half barb
+            pos = max(pos, step)
+            bx, by = ex - ux * pos, ey - uy * pos
+            self.cv.create_line(bx, by, bx + px * bl * 0.5 + ux * step * 0.3,
+                                by + py * bl * 0.5 + uy * step * 0.3, fill=col, width=1.5)
 
 
 # --------------------------------------------------------------------------
@@ -309,6 +495,7 @@ class MapView(tk.Canvas):
         self._drag = None
         self._pending = None
         self._photos = []
+        self._ov_tips = {}                 # overlay hover texts
         self._fitted = None                # view box to keep fitted until the user zooms / pans
         self.bind("<Configure>", self._resized)
         self.bind("<MouseWheel>", self._wheel)                       # Windows / macOS
@@ -452,15 +639,21 @@ class MapView(tk.Canvas):
     def _item_at(self, x, y):
         for item in reversed(self.find_overlapping(x - 3, y - 3, x + 3, y + 3)):
             for tag in self.gettags(item):
-                if tag.startswith(("id:", "site:")):
+                if tag.startswith(("id:", "site:", "ov:")):
                     k, v = tag.split(":", 1)
                     return k, v
         return None, None
 
     def _hover(self, e):
         self.delete("tip")
+        if self.scale is not None:
+            self.app.show_readout(e.x, e.y)
         kind, val = self._item_at(e.x, e.y)
-        if kind == "id":
+        if kind == "ov":
+            txt = self._ov_tips.get(val)
+            if not txt:
+                return
+        elif kind == "id":
             r = self.app.by_id.get(val)
             if not r:
                 return
@@ -468,7 +661,8 @@ class MapView(tk.Canvas):
             txt = (f"{r['track_id']}  {r['cref_dbz']:.0f} dBZ  lightning {L['p_lightning_55_60'] * 100:.0f}%\n"
                    f"{r['wfo'] or 'over water'} -> {L['wfo_at_55_60'] or 'over water'}")
         elif kind == "site":
-            txt = f"Radar {val.upper()} - click to view this site"
+            txt = (f"{'TDWR' if val in self.app.tdwr else 'Radar'} {val.upper()}"
+                   " - click to view this site")
         else:
             return
         t = self.create_text(e.x + 14, e.y - 14, text=txt, anchor="sw", fill=FG,
@@ -496,7 +690,7 @@ class MapView(tk.Canvas):
             sub = np.where(mask[r0:r1, c0:c1], sub, 0)
         if k >= 2:
             h, w = sub.shape
-            sub = (sub.reshape(h // k, k, w // k, k).max(axis=(1, 3)) if kind == "refl"
+            sub = (sub.reshape(h // k, k, w // k, k).max(axis=(1, 3)) if kind == "max"
                    else sub[::k, ::k])
         if not sub.any():
             return
@@ -516,7 +710,7 @@ class MapView(tk.Canvas):
             return
         self.delete("radar")
         self._photos = []
-        for codes, g, lut, kind in self.app.layers():
+        for codes, g, lut, kind, _ in self.app.layers():
             self._draw_raster(codes, g, lut, self.app.mask_for(g), kind)
         self.tag_lower("radar")
         self.tag_lower("land")
@@ -565,7 +759,7 @@ class MapView(tk.Canvas):
             for pts in states:
                 if len(pts) >= 6:
                     self.create_polygon(pts, fill=LAND, outline="", tags="land")
-        for codes, gr, lut, kind in app.layers():
+        for codes, gr, lut, kind, _ in app.layers():
             self._draw_raster(codes, gr, lut, app.mask_for(gr), kind)
         if self.geo:
             if app.show_counties.get() and ppk >= 0.6:
@@ -579,6 +773,7 @@ class MapView(tk.Canvas):
                     self.create_text(float(px), float(py), text=postal, fill="#5d7489",
                                      font=("Segoe UI Semibold", 8 if ppk < 0.6 else 10))
         self._draw_sites()
+        self._draw_overlays()
         self._draw_storms()
         cw, ch = self.winfo_width(), self.winfo_height()
         if not self.geo:
@@ -587,19 +782,19 @@ class MapView(tk.Canvas):
         self._draw_frame_label()
         self.create_text(10, ch - 8, anchor="sw", fill=MUTED, font=("Segoe UI", 8),
                          text="Scroll to zoom  |  drag to pan  |  click a storm or radar site  |"
-                              "  space = play/pause, arrows = step")
+                              "  space = play/pause, arrows = step  |  hover = value")
         self.tag_lower("radar")
         self.tag_lower("land")
 
     def _draw_sites(self):
         app = self.app
         ppk = self.px_per_km()
-        if app.site and app.show_nexrad.get() and app.site in app.site_locs:
+        ring = app.site_range_km()
+        if app.site and app.show_nexrad.get() and app.site in app.site_locs and ring:
             lat, lon = app.site_locs[app.site]
-            rng = 460.0 if app.product == "refl" else 300.0
             a = np.radians(np.arange(0, 361, 3))
-            lats = lat + rng / 111.0 * np.cos(a)
-            lons = lon + rng / (111.32 * math.cos(math.radians(lat))) * np.sin(a)
+            lats = lat + ring / 111.0 * np.cos(a)
+            lons = lon + ring / (111.32 * math.cos(math.radians(lat))) * np.sin(a)
             x, y = self.to_px(lons, lats)
             self.create_line(np.column_stack([x, y]).ravel().tolist(), fill=ACCENT, dash=(5, 4))
         if not app.show_sites.get() or ppk < 0.22:
@@ -607,17 +802,101 @@ class MapView(tk.Canvas):
         for s, (lat, lon) in app.site_locs.items():
             if nr.site_domain(lat, lon) != self.domain:
                 continue
+            tdwr = s in app.tdwr
+            sel = s == app.site
+            if tdwr and ppk < 0.45 and not sel:          # keep the national view uncluttered
+                continue
             x, y = (float(v) for v in self.to_px(lon, lat))
             if not (-50 < x < self.winfo_width() + 50 and -50 < y < self.winfo_height() + 50):
                 continue
-            sel = s == app.site
             tags = ("site:" + s,)
-            self.create_rectangle(x - 3, y - 3, x + 3, y + 3, fill=ACCENT if sel else "#c8d4de",
-                                  outline="#000000", tags=tags)
+            if tdwr:
+                self.create_polygon(x, y - 4, x + 4, y, x, y + 4, x - 4, y,
+                                    fill=ACCENT if sel else "#b59ce0", outline="#000000", tags=tags)
+            else:
+                self.create_rectangle(x - 3, y - 3, x + 3, y + 3, fill=ACCENT if sel else "#c8d4de",
+                                      outline="#000000", tags=tags)
             if ppk >= 0.45 or sel:
                 self.create_text(x + 6, y, anchor="w", text=s.upper(), tags=tags,
-                                 fill=ACCENT if sel else "#a9bccc",
+                                 fill=ACCENT if sel else ("#b59ce0" if tdwr else "#a9bccc"),
                                  font=("Segoe UI Semibold" if sel else "Segoe UI", 8))
+
+    def _ov_tag(self, text):
+        k = str(len(self._ov_tips))
+        self._ov_tips[k] = text
+        return ("ov:" + k,)
+
+    def _draw_overlays(self):
+        """Storm tracks, hail, mesocyclones, TVS and melting layer of the selected radar."""
+        self._ov_tips = {}
+        app = self.app
+        ovs = app.site_overlays
+        if not (app.site and app.show_nexrad.get() and ovs and app.at_latest()
+                and app.site in app.site_locs):
+            return
+        lat0, lon0 = app.site_locs[app.site]
+
+        def px(pts):
+            a = np.asarray(pts, float).reshape(-1, 2)
+            lon, lat = l3.km_to_lonlat(lat0, lon0, a[:, 0], a[:, 1])
+            x, y = self.to_px(lon, lat)
+            return np.column_stack([x, y])
+        show = {k: v.get() for k, v in app.ov_vars.items()}
+        if show["ml"] and "ml" in ovs:
+            dashes = {1: (2, 4), 2: (6, 3), 3: (6, 3), 4: (2, 4)}
+            for color, pts in ovs["ml"][1].get("ml", []):
+                xy = px(pts)
+                self.create_line(xy.ravel().tolist(), fill="#7fd4ff" if color in (2, 3) else "#3f8fc0",
+                                 dash=dashes.get(color, (4, 4)), width=1.5)
+        if show["sti"] and "sti" in ovs:
+            f = ovs["sti"][1]
+            for pts in f.get("past", []):
+                xy = px(pts)
+                if len(xy) > 1:
+                    self.create_line(xy.ravel().tolist(), fill="#c8d4de", width=1.5)
+            for x, y in px(f.get("past_pts", [])) if f.get("past_pts") else []:
+                self.create_oval(x - 2.5, y - 2.5, x + 2.5, y + 2.5, outline="#c8d4de", fill=WATER)
+            for pts in f.get("fcst", []):
+                xy = px(pts)
+                if len(xy) > 1:
+                    self.create_line(xy.ravel().tolist(), fill="#ffffff", width=1.5, dash=(5, 3))
+            for x, y in px(f.get("fcst_pts", [])) if f.get("fcst_pts") else []:
+                self.create_line(x - 3, y, x + 3, y, fill="#ffffff")
+                self.create_line(x, y - 3, x, y + 3, fill="#ffffff")
+            for (x, y), (_, _, sid) in zip(px([(a, b) for a, b, _ in f.get("ids", [])]) if f.get("ids") else [],
+                                           f.get("ids", [])):
+                self.create_text(x + 7, y - 7, text=sid, fill="#ffffff", anchor="sw",
+                                 font=("Segoe UI Semibold", 9),
+                                 tags=self._ov_tag(f"Storm {sid} (radar storm tracking)"))
+        if show["hail"] and "hail" in ovs:
+            for x_km, y_km, poh, posh, size in ovs["hail"][1].get("hail", []):
+                if poh < 30 and posh < 30:
+                    continue
+                (x, y), = px([(x_km, y_km)])
+                fill = "#ff3c3c" if posh >= 50 else ("#ffd23c" if posh >= 30 or poh >= 50 else "")
+                r = 6 if posh >= 50 else 5
+                txt = f"Hail: {poh}% chance of hail, {posh}% chance of severe hail"
+                if size > 0:
+                    txt += f", max size {size} in"
+                self.create_polygon(x, y - r, x + r, y + r * 0.8, x - r, y + r * 0.8,
+                                    fill=fill, outline="#46d246" if not fill else "#000000",
+                                    width=1.5, tags=self._ov_tag(txt))
+        if show["meso"] and "meso" in ovs:
+            for x_km, y_km, typ, rad in ovs["meso"][1].get("meso", []):
+                (x, y), = px([(x_km, y_km)])
+                r = max(rad * self.px_per_km(), 6)
+                self.create_oval(x - r, y - r, x + r, y + r, outline="#ffe040",
+                                 width=3 if typ >= 5 else 2,
+                                 tags=self._ov_tag(f"Mesocyclone / circulation (type {typ}), "
+                                                   f"radius {rad:.0f} km"))
+        if show["tvs"] and "tvs" in ovs:
+            f = ovs["tvs"][1]
+            for kind, pts in (("TVS", f.get("tvs", [])), ("Elevated TVS", f.get("etvs", []))):
+                for x, y in px(pts) if pts else []:
+                    self.create_polygon(x - 7, y - 6, x + 7, y - 6, x, y + 8,
+                                        fill="#ff2020" if kind == "TVS" else "",
+                                        outline="#ff2020", width=2,
+                                        tags=self._ov_tag(f"{kind} (tornado vortex signature)"))
 
     def _draw_storms(self):
         app = self.app
@@ -643,7 +922,7 @@ class MapView(tk.Canvas):
             self.create_line(np.column_stack([x, y]).ravel().tolist(), fill=FG,
                              arrow="last", arrowshape=(7, 8, 3))
         sel = app.selected
-        refl = app.table("refl")
+        refl = app.table("BR")
         ppk = self.px_per_km()
         for r in sorted(rows, key=lambda r: r["cref_dbz"]):
             x, y = (float(v) for v in self.to_px(r["lon"], r["lat"]))
@@ -664,7 +943,7 @@ class MapView(tk.Canvas):
 
 
 class Legend(tk.Canvas):
-    """Colour bar for the active colour table."""
+    """Colour bar (or class key) for the active colour table."""
 
     def __init__(self, master):
         super().__init__(master, height=34, bg=BG, highlightthickness=0)
@@ -678,11 +957,20 @@ class Legend(tk.Canvas):
         if table is None:
             return
         w = max(self.winfo_width(), 200)
+        if table.labels:                                  # categorical (hydrometeor classes)
+            n = len(table.labels)
+            bw = min(48, (w - 10) / n)
+            for i, (k, lab) in enumerate(sorted(table.labels.items())):
+                c = table.color(k) or (0, 0, 0, 0)
+                x = 4 + i * bw
+                self.create_rectangle(x, 2, x + bw - 2, 15, fill="#%02x%02x%02x" % c[:3], outline="")
+                self.create_text(x + bw / 2 - 1, 21, anchor="n", fill=MUTED, font=("Consolas", 8),
+                                 text=lab)
+            return
         x0, x1 = 70, w - 20
         lo, hi = table.value_range()
-        last = table.stops[-1]
-        if last.solid or len(table.stops) < 2:
-            hi += 5.0 if table.kind == "refl" else 10.0
+        if table.stops[-1].solid or len(table.stops) < 2:
+            hi += (hi - lo) * 0.07 or 1.0
         vals = lo + (hi - lo) * (np.arange(x1 - x0) + 0.5) / (x1 - x0)
         row = np.zeros((len(vals), 4), np.uint8)
         for i, v in enumerate(vals):
@@ -691,14 +979,21 @@ class Legend(tk.Canvas):
                 row[i] = (*c[:3], 255)
         img = Image.fromarray(np.repeat(row[None], 12, axis=0), "RGBA")
         self._photo = ImageTk.PhotoImage(img)
-        self.create_text(4, 9, anchor="w", fill=MUTED, font=("Segoe UI", 9),
-                         text="dBZ" if table.kind == "refl" else table.units.lower())
+        units = ({"DBZ": "dBZ", "DB": "dB", "MPS": "m/s", "M/S": "m/s"}.get(table.units, table.units.lower())
+                 if table.units else ct.FAMILIES[table.family][1])
+        self.create_text(4, 9, anchor="w", fill=MUTED, font=("Segoe UI", 9), text=units)
         self.create_image(x0, 3, image=self._photo, anchor="nw")
-        step = 10 if table.kind == "refl" or table.units in ("MPS", "M/S") else 20
-        for v in range(int(math.ceil(lo / step) * step), int(hi) + 1, step):
-            x = x0 + (v - lo) / (hi - lo) * (x1 - x0)
+        span = hi - lo
+        raw = span / 10.0
+        mag = 10 ** math.floor(math.log10(raw)) if raw > 0 else 1
+        step = next(m * mag for m in (1, 2, 2.5, 5, 10) if m * mag >= raw)
+        v = math.ceil(lo / step) * step
+        while v <= hi + 1e-9:
+            x = x0 + (v - lo) / span * (x1 - x0)
             self.create_line(x, 15, x, 19, fill=MUTED)
-            self.create_text(x, 21, anchor="n", fill=MUTED, font=("Consolas", 8), text=str(v))
+            lab = f"{v:g}" if abs(v) >= 1 or v == 0 else f"{v:.2f}".rstrip("0")
+            self.create_text(x, 21, anchor="n", fill=MUTED, font=("Consolas", 8), text=lab)
+            v += step
 
 
 # --------------------------------------------------------------------------
@@ -707,7 +1002,7 @@ class Legend(tk.Canvas):
 class App(tk.Tk):
     def __init__(self, cfg: st.Config, loop_min: float, top: int):
         super().__init__()
-        self.title(f"Storm Tracker {APP_VERSION}")
+        self.title(f"{APP_NAME} {APP_VERSION}")
         self.geometry("1400x900")
         self.minsize(1000, 650)
         def maximise():
@@ -717,6 +1012,8 @@ class App(tk.Tk):
                 pass
         self.after(50, maximise)
         self.configure(bg=BG)
+        if FROZEN:                          # no console in the exe: keep errors in the log
+            self.report_callback_exception = lambda *exc: log.error("window error", exc_info=exc)
         self.cfg = cfg
         self.all_rows, self.rows, self.by_id, self.selected = [], [], {}, None
         self.last_result = None
@@ -728,8 +1025,11 @@ class App(tk.Tk):
         self.mrms = {d: {} for d in um.DOMAINS}
         self.site_locs = {}               # site -> (lat, lon)
         self.site = None                  # selected radar site (lower case) or None = mosaic
-        self.product = "refl"
+        self.tdwr = set()                 # TDWR (airport radar) site ids
+        self.product = "N0Q"              # level3 product key
+        self.tilt = 0
         self.site_data = None
+        self.site_overlays = {}
         self.dom_grids = {d: um.domain_grid(d) for d in um.DOMAINS}
         self._masks = {}
         # loop state
@@ -741,8 +1041,8 @@ class App(tk.Tk):
         # colour tables
         self.tables = {k: list(v) for k, v in ct.BUILTIN.items()}
         for t in ct.load_folder(PAL_DIR):
-            self.tables[t.kind].append(t)
-        self.table_sel = {"refl": 0, "vel": 0}
+            self.tables[t.family].append(t)
+        self.table_sel = {f: 0 for f in self.tables}
         # layer switches
         self.show_nexrad = tk.BooleanVar(value=True)
         self.show_mrms = tk.BooleanVar(value=False)
@@ -751,6 +1051,7 @@ class App(tk.Tk):
         self.show_counties = tk.BooleanVar(value=True)
         self.show_sites = tk.BooleanVar(value=True)
         self.us_only = tk.BooleanVar(value=True)
+        self.ov_vars = {k: tk.BooleanVar(value=k != "ml") for k in l3.OVERLAYS}
         self.region = tk.StringVar(value="CONUS")
         # processes / threads
         self.q = mp.Queue()
@@ -758,12 +1059,13 @@ class App(tk.Tk):
         self.stop = mp.Event()
         self.mrms_wake, self.nex_wake = mp.Event(), mp.Event()
         self.mrms_on, self.nex_on = mp.Event(), mp.Event()
+        self.mrms_refl_on = mp.Event()
         self._style()
         self._build()
         self._sync_workers()
         self.mrms_proc = mp.Process(target=run_mrms_worker, daemon=True,
                                     args=(cfg, loop_min, top, self.q, self.mrms_wake,
-                                          self.stop, self.mrms_on))
+                                          self.stop, self.mrms_on, self.mrms_refl_on))
         self.nex_proc = mp.Process(target=run_nexrad_worker, daemon=True,
                                    args=(loop_min, self.q, self.nex_wake, self.stop, self.nex_on))
         self.mrms_proc.start()
@@ -835,7 +1137,7 @@ class App(tk.Tk):
         # header
         top = ttk.Frame(self, padding=(14, 10, 14, 4))
         top.pack(fill="x")
-        ttk.Label(top, text="Storm Tracker", style="Title.TLabel").pack(side="left")
+        ttk.Label(top, text=APP_NAME, style="Title.TLabel").pack(side="left")
         self.status_lbl = ttk.Label(top, text="Starting...", style="Muted.TLabel")
         self.status_lbl.pack(side="left", padx=18)
         self.next_lbl = ttk.Label(top, text="", style="Muted.TLabel")
@@ -872,20 +1174,24 @@ class App(tk.Tk):
                                     values=["All sites (mosaic)"])
         self.site_cb.pack(side="left")
         self.site_cb.bind("<<ComboboxSelected>>", lambda e: self.choose_site(
-            None if self.site_var.get().startswith("All") else self.site_var.get().lower()))
+            None if self.site_var.get().startswith("All") else self.site_var.get().split()[0]))
         ttk.Label(bar, text="Product", style="Muted.TLabel").pack(side="left", padx=(12, 4))
-        self.prod_var = tk.StringVar(value="Reflectivity")
-        self.prod_cb = ttk.Combobox(bar, textvariable=self.prod_var, state="disabled", width=13,
-                                    values=["Reflectivity", "Velocity"])
+        self.prod_var = tk.StringVar()
+        self.prod_cb = ttk.Combobox(bar, textvariable=self.prod_var, state="readonly", width=34,
+                                    height=40)
         self.prod_cb.pack(side="left")
         self.prod_cb.bind("<<ComboboxSelected>>", lambda e: self._product_changed())
+        ttk.Label(bar, text="Tilt", style="Muted.TLabel").pack(side="left", padx=(8, 4))
+        self.tilt_var = tk.StringVar()
+        self.tilt_cb = ttk.Combobox(bar, textvariable=self.tilt_var, state="readonly", width=7)
+        self.tilt_cb.pack(side="left")
+        self.tilt_cb.bind("<<ComboboxSelected>>", lambda e: self._tilt_changed())
         ttk.Label(bar, text="Color table", style="Muted.TLabel").pack(side="left", padx=(12, 4))
         self.table_var = tk.StringVar()
         self.table_cb = ttk.Combobox(bar, textvariable=self.table_var, state="readonly", width=22)
         self.table_cb.pack(side="left")
         self.table_cb.bind("<<ComboboxSelected>>", lambda e: self._table_changed())
         ttk.Button(bar, text="Load .pal...", command=self._load_pal).pack(side="left", padx=6)
-        ttk.Button(bar, text="Reset view", command=self._reset_view).pack(side="right")
 
         # row 2: layers
         lay = ttk.Frame(upper)
@@ -901,6 +1207,19 @@ class App(tk.Tk):
                 ("US only (hide other countries)", self.us_only, None)]:
             ttk.Checkbutton(lay, text=text, variable=var,
                             command=cmd or (lambda: self.map.redraw())).pack(side="left", padx=(0, 12))
+
+        # row 3: single-radar overlays, wind profile, value under the cursor
+        ovr = ttk.Frame(upper)
+        ovr.pack(fill="x", pady=(0, 6))
+        ttk.Label(ovr, text="Radar-site overlays:", style="Muted.TLabel").pack(side="left", padx=(0, 6))
+        for k, (name, _) in l3.OVERLAYS.items():
+            ttk.Checkbutton(ovr, text=name, variable=self.ov_vars[k],
+                            command=lambda: self.map.redraw()).pack(side="left", padx=(0, 12))
+        self.vwp_btn = ttk.Button(ovr, text="Wind profile (VWP)...", command=self._open_vwp)
+        self.vwp_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(ovr, text="Reset view", command=self._reset_view).pack(side="right")
+        self.readout_lbl = ttk.Label(ovr, text="", style="Muted.TLabel", font=("Consolas", 9))
+        self.readout_lbl.pack(side="right", padx=(0, 12))
 
         body = ttk.Frame(upper)
         body.pack(fill="both", expand=True)
@@ -932,6 +1251,7 @@ class App(tk.Tk):
                      values=list(SPEEDS)).pack(side="left")
         self.legend = Legend(ctl)
         self.legend.pack(side="left", fill="x", expand=True, padx=(16, 0))
+        self._set_product_choices()
         self._refresh_table_choices()
 
         # tables
@@ -1031,24 +1351,42 @@ class App(tk.Tk):
             m = self._masks[g] = um.us_mask(g, self.map.base.mask_rings[g.domain])
         return m
 
+    @property
+    def family(self):
+        """Colour-table family of the radar layer being shown."""
+        return l3.BY_KEY[self.product].family if self.site else "BR"
+
     def _site_frames(self):
+        """{time: (time, codes, values, rf, elev, grid)} for the selected site/product/tilt."""
         sd = self.site_data
-        if (sd and self.site and sd["req"][0] == self.site and sd["req"][1] == self.product
-                and sd["req"][2] == self.map.domain):
-            return dict(sd["frames"])
+        if (sd and self.site and sd["req"][:3] == (self.site, self.product, self.tilt)
+                and sd["req"][3] == self.map.domain):
+            return {f[0]: f for f in sd["frames"]}
         return {}
 
     def _primary(self):
-        """{time: codes} of the layer that drives the loop, plus its grid."""
+        """{time: frame} of the layer that drives the loop."""
         dom = self.map.domain
         if self.show_nexrad.get():
             if self.site:
-                sd = self.site_data
-                return self._site_frames(), sd["grid"] if sd else None
+                return self._site_frames(), None
             return {t: v[dom] for t, v in self.nex.items() if dom in v}, self.dom_grids[dom]
         if self.show_mrms.get():
             return self.mrms[dom], self.dom_grids[dom]
         return {}, None
+
+    def _current_site_frame(self):
+        fr = self._site_frames()
+        if not fr:
+            return None
+        return fr.get(self.current_time()) or fr[max(fr)]
+
+    def site_range_km(self):
+        f = self._current_site_frame()
+        if f is None:
+            return None
+        g = f[5]
+        return g.nx * g.res / 2 / 1.04 / 1000.0
 
     def frame_times(self):
         return sorted(self._primary()[0])
@@ -1066,12 +1404,16 @@ class App(tk.Tk):
     def layer_title(self):
         if self.show_nexrad.get():
             if self.site:
-                return f"{self.site.upper()} {nr.PRODUCTS[self.product][3]}"
+                p = l3.BY_KEY[self.product]
+                f = self._current_site_frame()
+                el = f"  {f[4]:.1f}\u00b0" if f and f[4] is not None else ""
+                return f"{self.site.upper()} {p.key} {p.name}{el}"
             return "NEXRAD mosaic" + (" + MRMS" if self.show_mrms.get() else "")
         return "MRMS composite reflectivity" if self.show_mrms.get() else "No radar layer"
 
     def layers(self):
-        """[(codes, grid, lut, kind)] to draw for the current loop time, bottom first."""
+        """[(codes, grid, lut, reduce, (values, rf, family, name))] to draw for the
+        current loop time, bottom first.  reduce = "max" or "sub" (see _draw_raster)."""
         T = self.current_time()
         dom = self.map.domain
         out = []
@@ -1084,22 +1426,50 @@ class App(tk.Tk):
             t = min(d, key=lambda t: abs((t - T).total_seconds()))
             return d[t] if abs((t - T).total_seconds()) <= MATCH_MIN * 60 else None
 
-        refl = self.table("refl").lut()
+        refl = self.table("BR").lut()
         if self.show_mrms.get():
             c = pick(self.mrms[dom])
             if c is not None:
-                out.append((c, self.dom_grids[dom], refl, "refl"))
+                out.append((c, self.dom_grids[dom], refl, "max",
+                            (ct.REFL_VALUES, None, "BR", "MRMS")))
         if self.show_nexrad.get():
             if self.site:
-                c = pick(self._site_frames())
-                if c is not None:
-                    out.append((c, self.site_data["grid"], self.table(self.product).lut(),
-                                self.product))
+                f = pick(self._site_frames())
+                if f is not None:
+                    fam = self.family
+                    _, codes, values, rf, _, grid = f
+                    out.append((codes, grid, self.table(fam).lut_for(values, rf),
+                                "max" if fam in ("BR", "ET", "VIL", "PRECIP") else "sub",
+                                (values, rf, fam, f"{self.site.upper()} {self.product}")))
             else:
                 c = pick({t: v[dom] for t, v in self.nex.items() if dom in v})
                 if c is not None:
-                    out.append((c, self.dom_grids[dom], refl, "refl"))
+                    out.append((c, self.dom_grids[dom], refl, "max",
+                                (ct.REFL_VALUES, None, "BR", "Mosaic")))
         return out
+
+    def show_readout(self, px, py):
+        """Lat/lon and the data value under the mouse pointer."""
+        m = self.map
+        x, y = (px - m.ox) / m.scale, (m.oy - py) / m.scale
+        lon, lat = (float(v) for v in um.unproject(m.domain, x, y))
+        txt = f"{abs(lat):.2f}\u00b0{'N' if lat >= 0 else 'S'} {abs(lon):.2f}\u00b0{'W' if lon < 0 else 'E'}"
+        for codes, g, _, _, (values, rf, fam, name) in reversed(self.layers()):
+            r, c = int((g.y1 - y) / g.res), int((x - g.x0) / g.res)
+            if not (0 <= r < g.ny and 0 <= c < g.nx):
+                continue
+            mask = self.mask_for(g)
+            if mask is not None and not mask[r, c]:
+                continue
+            code = int(codes[r, c])
+            if rf is not None and code == rf:
+                txt += f"   {name}: range folded"
+                break
+            v = values[code]
+            if np.isfinite(v):
+                txt += f"   {name}: {fmt_value(float(v), fam)}"
+                break
+        self.readout_lbl.config(text=txt)
 
     # ---------------- loop controls ----------------
     def _sync_loop(self):
@@ -1201,7 +1571,7 @@ class App(tk.Tk):
     def _reset_view(self):
         if self.site and self.site in self.site_locs:
             lat, lon = self.site_locs[self.site]
-            self.map.zoom_to(lon, lat, 330)
+            self.map.zoom_to(lon, lat, min(self.site_range_km() or 300, 330))
         else:
             self.map.fit()
 
@@ -1214,6 +1584,14 @@ class App(tk.Tk):
             self.mrms_on.set()
         else:
             self.mrms_on.clear()
+        if self.show_mrms.get():
+            if not self.mrms_refl_on.is_set():
+                self.mrms_refl_on.set()
+                if not any(self.mrms.values()):
+                    self.mrms_wake.set()             # fetch the MRMS layer now, not in 2 min
+        else:
+            self.mrms_refl_on.clear()
+            self.mrms = {d: {} for d in um.DOMAINS}  # free the frames while hidden
 
     def _sources_changed(self):
         self._sync_workers()
@@ -1224,14 +1602,26 @@ class App(tk.Tk):
         self.map.redraw()
         self._show_rows()
 
+    def _site_label(self, site):
+        return f"{site.upper()} (TDWR)" if site in self.tdwr else site.upper()
+
+    def _update_site_list(self):
+        nex = sorted(s for s in self.site_locs if s not in self.tdwr)
+        self.site_cb.config(values=["All sites (mosaic)"] + [s.upper() for s in nex] +
+                            [self._site_label(s) for s in sorted(self.tdwr)])
+
     def choose_site(self, site):
         site = site.lower() if site else None
         if site and site not in self.site_locs:
             return
         self.site = site
-        self.site_var.set(site.upper() if site else "All sites (mosaic)")
+        self.site_overlays = {}
+        self.site_data = None
         if site:
-            self.prod_cb.config(state="readonly")
+            tdwr = site in self.tdwr
+            if l3.BY_KEY[self.product].tdwr != tdwr:      # TDWR sites have their own products
+                self.product, self.tilt = ("TZ0" if tdwr else "N0Q"), 0
+            self.site_var.set(self._site_label(site))
             if not self.show_nexrad.get():
                 self.show_nexrad.set(True)
             lat, lon = self.site_locs[site]
@@ -1240,46 +1630,98 @@ class App(tk.Tk):
                 self.region.set(dom)
                 self.map.domain = dom
             self.fi = None
-            self.map.zoom_to(lon, lat, 330)
+            self.map.zoom_to(lon, lat, 120 if tdwr else 330)
             self._request_site()
         else:
             self.site_loader.request(None)
-            self.product = "refl"
-            self.prod_var.set("Reflectivity")
-            self.prod_cb.config(state="disabled")
-            self.site_data = None
+            self.product, self.tilt = "N0Q", 0
+            self.site_var.set("All sites (mosaic)")
             self.fi = None
             self.radar_lbl.config(text=self._mosaic_status(), foreground=MUTED)
             self.map.fit()
         self._sync_workers()
+        self._set_product_choices()
         self._refresh_table_choices()
         self._sync_loop()
 
     def _request_site(self):
         lat, lon = self.site_locs[self.site]
-        self.site_loader.request((self.site, self.product, nr.site_domain(lat, lon), lat, lon))
+        self.site_loader.request((self.site, self.product, self.tilt,
+                                  nr.site_domain(lat, lon), lat, lon))
+
+    def _set_product_choices(self):
+        tdwr = bool(self.site and self.site in self.tdwr)
+        prods = [p for p in l3.PRODUCTS if p.tdwr == tdwr]
+        self.prod_cb.config(values=[f"{p.key}  {p.name}" for p in prods])
+        p = l3.BY_KEY[self.product]
+        self.prod_var.set(f"{p.key}  {p.name}")
+        labels = [t[0] for t in p.tilts]
+        self.tilt = min(self.tilt, len(labels) - 1)
+        self.tilt_cb.config(values=labels, state="readonly" if len(labels) > 1 else "disabled")
+        self.tilt_var.set(labels[self.tilt])
+        self.vwp_btn.config(state="normal" if self.site and not tdwr else "disabled")
+
+    def _nearest_site(self):
+        """NEXRAD site nearest the middle of the map."""
+        m = self.map
+        cx = (m.winfo_width() / 2 - m.ox) / m.scale
+        cy = (m.oy - m.winfo_height() / 2) / m.scale
+        lon, lat = (float(v) for v in um.unproject(m.domain, cx, cy))
+        k = math.cos(math.radians(lat))
+        cands = [(((la - lat) ** 2 + ((lo - lon) * k) ** 2), s) for s, (la, lo) in self.site_locs.items()
+                 if s not in self.tdwr and nr.site_domain(la, lo) == m.domain]
+        return min(cands)[1] if cands else None
 
     def _product_changed(self):
-        self.product = "vel" if self.prod_var.get() == "Velocity" else "refl"
+        key = self.prod_var.get().split()[0]
+        if key not in l3.BY_KEY:
+            return
+        self.product = key
         self.fi = None
+        self.site_data = None
         if self.site:
             self._request_site()
+        elif key != "N0Q":                       # the mosaic is base reflectivity only
+            site = self._nearest_site()
+            if site:
+                self.choose_site(site)
+                return
+            self.product = "N0Q"
+            self.radar_lbl.config(text="Radar site list is still loading - try again in a moment",
+                                  foreground=ACCENT)
+        self._set_product_choices()
         self._refresh_table_choices()
         self._sync_loop()
         self.map.redraw()
 
+    def _tilt_changed(self):
+        labels = [t[0] for t in l3.BY_KEY[self.product].tilts]
+        if self.tilt_var.get() in labels:
+            self.tilt = labels.index(self.tilt_var.get())
+        self.fi = None
+        self.site_data = None
+        if self.site:
+            self._request_site()
+        self._sync_loop()
+        self.map.redraw()
+
+    def _open_vwp(self):
+        if self.site and self.site not in self.tdwr:
+            VwpWindow(self, self.site)
+
     def _refresh_table_choices(self):
-        kind = self.product
-        names = [t.name for t in self.tables[kind]]
+        fam = self.family
+        names = [t.name for t in self.tables[fam]]
         self.table_cb.config(values=names)
-        self.table_var.set(names[self.table_sel[kind]])
-        self.legend.draw(self.table(kind))
+        self.table_var.set(names[self.table_sel[fam]])
+        self.legend.draw(self.table(fam))
 
     def _table_changed(self):
-        names = [t.name for t in self.tables[self.product]]
+        fam = self.family
+        names = [t.name for t in self.tables[fam]]
         if self.table_var.get() in names:
-            self.table_sel[self.product] = names.index(self.table_var.get())
-        self.legend.draw(self.table(self.product))
+            self.table_sel[fam] = names.index(self.table_var.get())
+        self.legend.draw(self.table(fam))
         self.map.redraw()
 
     def _load_pal(self):
@@ -1301,12 +1743,13 @@ class App(tk.Tk):
                 shutil.copyfile(path, dst)
         except OSError:
             pass
-        lst = self.tables[t.kind]
+        lst = self.tables[t.family]
         lst[:] = [x for x in lst if x.name != t.name] + [t]
-        self.table_sel[t.kind] = len(lst) - 1
-        if t.kind == "vel" and self.product != "vel":
-            self.radar_lbl.config(text=f"Loaded velocity table '{t.name}' - pick a radar site "
-                                       "and Product = Velocity to use it", foreground=ACCENT)
+        self.table_sel[t.family] = len(lst) - 1
+        if t.family != self.family:
+            self.radar_lbl.config(text=f"Loaded {ct.FAMILIES[t.family][0].lower()} table "
+                                       f"'{t.name}' - it is used for those products",
+                                  foreground=ACCENT)
         else:
             self.radar_lbl.config(text=f"Loaded colour table '{t.name}'", foreground=MUTED)
         self._refresh_table_choices()
@@ -1372,9 +1815,13 @@ class App(tk.Tk):
                 elif kind == "sites":
                     if val:
                         self.site_locs.update(val)
-                        self.site_cb.config(values=["All sites (mosaic)"] +
-                                            [s.upper() for s in sorted(self.site_locs)])
+                        self._update_site_list()
                         dirty |= self.show_sites.get()
+                elif kind == "tdwr_sites":
+                    self.tdwr |= set(val)
+                    self.site_locs.update(val)
+                    self._update_site_list()
+                    dirty |= self.show_sites.get()
                 elif kind == "radar_status":
                     if not self.site:
                         self.radar_lbl.config(text=val, foreground=MUTED)
@@ -1392,14 +1839,29 @@ class App(tk.Tk):
                                           foreground=LEVEL_COLORS["VERY HIGH"])
                 elif kind == "site_frames":
                     req = val["req"]
-                    if self.site == req[0] and self.product == req[1]:
+                    if req[:3] == (self.site, self.product, self.tilt):
                         self.site_data = val
                         fr = val["frames"]
-                        self.radar_lbl.config(
-                            text=f"Radar site {req[0].upper()} {nr.PRODUCTS[req[1]][3].lower()}: "
-                                 f"{len(fr)} scans" + (f", newest {fr[-1][0]:%H:%MZ}" if fr else ""),
-                            foreground=MUTED)
+                        p = l3.BY_KEY[req[1]]
+                        name = f"{req[0].upper()} {p.key} {p.name}"
+                        if fr:
+                            msg, col = (f"{name}: {len(fr)} scans, newest {fr[-1][0]:%H:%MZ}", MUTED)
+                        elif val.get("stale"):
+                            msg, col = (f"{name}: this radar has not produced it since "
+                                        f"{val['stale']:%b %d, %Y}", ACCENT)
+                        elif val["listed"]:
+                            msg, col = (f"{name}: nothing to show right now "
+                                        "(e.g. no precipitation)", ACCENT)
+                        else:
+                            msg, col = (f"{name} is not available from this radar right now",
+                                        LEVEL_COLORS["VERY HIGH"])
+                        self.radar_lbl.config(text=msg, foreground=col)
+                        self._refresh_table_choices()
                         dirty = loop_dirty = True
+                elif kind == "site_overlays":
+                    if val["site"] == self.site:
+                        self.site_overlays = val["data"]
+                        dirty = True
                 elif kind == "basemap":
                     self.map.set_basemap(val)
                     self._show_rows()

@@ -112,14 +112,24 @@ def site_grid(domain: str, lon: float, lat: float, range_km: float, res_m: float
     return RasterGrid(domain, float(x) - half, float(y) + half, res_m, n, n)
 
 
-@functools.lru_cache(maxsize=6)
-def grid_lonlat(g: RasterGrid):
-    """(lon, lat) float32 arrays of every pixel centre."""
+def grid_lonlat_nocache(g: RasterGrid):
+    """(lon, lat) float32 arrays of every pixel centre, computed row block by row
+    block so the float64 temporaries stay small."""
     xs = g.x0 + (np.arange(g.nx) + 0.5) * g.res
-    ys = g.y1 - (np.arange(g.ny) + 0.5) * g.res
-    X, Y = np.meshgrid(xs, ys)
-    lon, lat = unproject(g.domain, X, Y)
-    return lon.astype(np.float32), lat.astype(np.float32)
+    lon = np.empty(g.shape, np.float32)
+    lat = np.empty(g.shape, np.float32)
+    step = max(1, 400_000 // g.nx)
+    for r0 in range(0, g.ny, step):
+        ys = g.y1 - (np.arange(r0, min(r0 + step, g.ny)) + 0.5) * g.res
+        X, Y = np.meshgrid(xs, ys)
+        lo, la = unproject(g.domain, X, Y)
+        lon[r0:r0 + len(ys)], lat[r0:r0 + len(ys)] = lo, la
+    return lon, lat
+
+
+@functools.lru_cache(maxsize=3)           # the three region grids; site grids are not cached
+def grid_lonlat(g: RasterGrid):
+    return grid_lonlat_nocache(g)
 
 
 # --------------------------------------------------------------------------
