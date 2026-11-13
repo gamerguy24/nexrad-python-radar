@@ -8,14 +8,20 @@ shapes look the way people expect instead of being stretched east-west.
 
 State and county outlines come from Natural Earth (10m) through cartopy's
 downloader (cached under ~/.local/share/cartopy after the first run).
+`python us_map.py --build-cache` projects and simplifies them once into
+basemap.pkl.gz, which the exe bundles so it needs neither cartopy nor a download.
 """
 from __future__ import annotations
 
 import functools
+import gzip
 import math
+import pickle
+import sys
 import threading
 import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
@@ -145,7 +151,31 @@ def _simplify(ring: np.ndarray, tol: float) -> np.ndarray:
     return np.asarray(shapely.LineString(ring).simplify(tol, preserve_topology=False).coords)
 
 
+BASEMAP_FILE = "basemap.pkl.gz"
+
+
+def _resource_dir() -> Path:
+    """Folder holding bundled data: the PyInstaller unpack dir, else this file's dir."""
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+
+
 def load_basemap() -> BaseMap:
+    """Pre-built base map (basemap.pkl.gz, made by `python us_map.py --build-cache`
+    and bundled into the exe); falls back to building it from Natural Earth."""
+    p = _resource_dir() / BASEMAP_FILE
+    if p.exists():
+        with gzip.open(p, "rb") as f:
+            return BaseMap(*pickle.load(f))
+    return build_basemap()
+
+
+def save_basemap(path: Path):
+    bm = build_basemap()
+    with gzip.open(path, "wb") as f:
+        pickle.dump((bm.land, bm.counties, bm.labels, bm.mask_rings), f, protocol=4)
+
+
+def build_basemap() -> BaseMap:
     land = {d: {"coarse": [], "fine": []} for d in DOMAINS}
     labels = {d: [] for d in DOMAINS}
     mask_rings = {d: [] for d in DOMAINS}
@@ -205,3 +235,12 @@ def us_mask(g: RasterGrid, foreign_rings: List[np.ndarray]) -> np.ndarray:
             continue
         d.polygon(list(zip(px.tolist(), py.tolist())), fill=1)
     return ~np.asarray(img, dtype=bool)
+
+
+if __name__ == "__main__":
+    if "--build-cache" in sys.argv:
+        out = Path(__file__).resolve().parent / BASEMAP_FILE
+        save_basemap(out)
+        print(f"wrote {out} ({out.stat().st_size / 1e6:.1f} MB)")
+    else:
+        print("usage: python us_map.py --build-cache")

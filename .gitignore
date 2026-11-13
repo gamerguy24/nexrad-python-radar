@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 mrms_cache/
 storm_out/
+build/
+dist/
+basemap.pkl.gz
+storm_tracker.log
+.write_test

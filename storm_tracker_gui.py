@@ -32,15 +32,20 @@ import io
 import logging
 import math
 import multiprocessing as mp
+import os
 import queue
+import re
 import shutil
+import sys
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import filedialog, ttk
 
 import numpy as np
+import requests
 import shapely
 from PIL import Image, ImageTk
 
@@ -51,8 +56,40 @@ import us_map as um
 
 log = logging.getLogger("storm_tracker.gui")
 UTC = dt.timezone.utc
-HERE = Path(__file__).resolve().parent
-PAL_DIR = HERE / "color_tables"
+APP_VERSION = "1.0.0"     # bump this, rebuild (build.bat) and publish a GitHub release
+GITHUB_REPO = "gamerguy24/nexrad-python-radar"
+FROZEN = getattr(sys, "frozen", False)      # running as the PyInstaller exe
+
+
+def _data_dir() -> Path:
+    """Where downloads, outputs, colour tables and the log live: next to the exe
+    (or this script); %LOCALAPPDATA%\\StormTracker if that folder is read-only."""
+    here = Path(sys.executable if FROZEN else __file__).resolve().parent
+    try:
+        probe = here / ".write_test"
+        probe.touch()
+        probe.unlink()
+        return here
+    except OSError:
+        alt = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "StormTracker"
+        alt.mkdir(parents=True, exist_ok=True)
+        return alt
+
+
+DATA_DIR = _data_dir()
+PAL_DIR = DATA_DIR / "color_tables"
+
+
+def _setup_logging():
+    """The exe has no console, so log to a file there; the script logs to the terminal."""
+    kw = dict(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    if FROZEN:
+        kw["filename"] = str(DATA_DIR / "storm_tracker.log")
+    logging.basicConfig(**kw)
+
+
+def _version_tuple(v: str):
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
 
 NEX_FRAMES, NEX_STEP_MIN = 12, 5      # radar-site loop: 12 frames, 5 min apart
 MRMS_FRAMES = 10                      # MRMS loop frames (6 min apart, from the tracker)
@@ -114,7 +151,7 @@ def _mrms_codes(arr, mg: st.Grid, g: um.RasterGrid, cache) -> np.ndarray:
 
 
 def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, enabled):
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    _setup_logging()
     wfos = None
     grids = {d: um.domain_grid(d) for d in cfg.domains}
     sent = {d: set() for d in cfg.domains}
@@ -165,7 +202,7 @@ def run_mrms_worker(cfg: st.Config, loop_min: float, top: int, q, wake, stop, en
 
 
 def run_nexrad_worker(loop_min: float, q, wake, stop, enabled):
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    _setup_logging()
     feeder = nr.NexradFeeder()
     grids = {d: um.domain_grid(d) for d in um.DOMAINS}
     have = set()
@@ -272,8 +309,8 @@ class MapView(tk.Canvas):
         self._drag = None
         self._pending = None
         self._photos = []
-        self.bind("<Configure>", lambda e: self.fit() if self.scale is None
-                  else self._schedule_redraw(100))
+        self._fitted = None                # view box to keep fitted until the user zooms / pans
+        self.bind("<Configure>", self._resized)
         self.bind("<MouseWheel>", self._wheel)                       # Windows / macOS
         self.bind("<Button-4>", lambda e: self._zoom(1.25, e.x, e.y))  # Linux
         self.bind("<Button-5>", lambda e: self._zoom(0.8, e.x, e.y))
@@ -318,7 +355,22 @@ class MapView(tk.Canvas):
     def fit(self, box=None):
         self.fit_xy(*um.box_bounds(self.domain, box or um.VIEW[self.domain]))
 
+    def _resized(self, _e):
+        if self.scale is None:
+            self.fit()
+        elif self._fitted:                 # untouched view: re-fit to the new size
+            self._schedule_refit()
+        else:
+            self._schedule_redraw(100)
+
+    def _schedule_refit(self):
+        if self._pending:
+            self.after_cancel(self._pending)
+        self._pending = self.after(100, lambda: (setattr(self, "_pending", None),
+                                                 self.fit_xy(*self._fitted)))
+
     def fit_xy(self, xmin, xmax, ymin, ymax):
+        self._fitted = (xmin, xmax, ymin, ymax)
         cw, ch = max(self.winfo_width(), 50), max(self.winfo_height(), 50)
         self.scale = min(cw / (xmax - xmin), ch / (ymax - ymin)) * 0.97
         self.ox = cw / 2 - (xmin + xmax) / 2 * self.scale
@@ -331,6 +383,7 @@ class MapView(tk.Canvas):
         self.fit_xy(float(x) - h, float(x) + h, float(y) - h, float(y) + h)
 
     def center_on(self, lon, lat):
+        self._fitted = None
         x, y = self.to_px(lon, lat)
         self.ox += self.winfo_width() / 2 - float(x)
         self.oy += self.winfo_height() / 2 - float(y)
@@ -342,6 +395,7 @@ class MapView(tk.Canvas):
         return min(cw / (xmax - xmin), ch / (ymax - ymin))
 
     def _zoom(self, f, x, y):
+        self._fitted = None
         fs = self._fit_scale()
         new = min(max(self.scale * f, fs * 0.5), fs * 150)
         f = new / self.scale
@@ -382,6 +436,7 @@ class MapView(tk.Canvas):
             self.ox += dx
             self.oy += dy
             self._drag = [x0, y0, e.x, e.y, True]
+            self._fitted = None
 
     def _release(self, e):
         if self._drag and not self._drag[4]:
@@ -652,7 +707,7 @@ class Legend(tk.Canvas):
 class App(tk.Tk):
     def __init__(self, cfg: st.Config, loop_min: float, top: int):
         super().__init__()
-        self.title("Storm Tracker")
+        self.title(f"Storm Tracker {APP_VERSION}")
         self.geometry("1400x900")
         self.minsize(1000, 650)
         def maximise():
@@ -717,6 +772,7 @@ class App(tk.Tk):
         self.site_loader.start()
         threading.Thread(target=lambda: self.lq.put(("basemap", um.load_basemap())),
                          daemon=True).start()
+        threading.Thread(target=self._check_for_update, daemon=True).start()
         self.after(200, self._poll)
         self.after(1000, self._tick)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -785,6 +841,8 @@ class App(tk.Tk):
         self.next_lbl = ttk.Label(top, text="", style="Muted.TLabel")
         self.next_lbl.pack(side="right")
         ttk.Button(top, text="Update now", command=self._update_now).pack(side="right", padx=10)
+        # shown only when GitHub has a newer release (see _check_for_update)
+        self.upgrade_btn = ttk.Button(top, style="Play.TButton")
         info = ttk.Frame(self, padding=(14, 0, 14, 6))
         info.pack(fill="x")
         self.summary_lbl = ttk.Label(info, text="", style="Muted.TLabel")
@@ -1345,6 +1403,11 @@ class App(tk.Tk):
                 elif kind == "basemap":
                     self.map.set_basemap(val)
                     self._show_rows()
+                elif kind == "new_version":
+                    tag, url = val
+                    self.upgrade_btn.config(text=f"New version {tag} available - download",
+                                            command=lambda: webbrowser.open(url))
+                    self.upgrade_btn.pack(side="right", padx=(0, 6))
         except queue.Empty:
             pass
         if loop_dirty:
@@ -1365,6 +1428,21 @@ class App(tk.Tk):
                          if self.radar_next_at else "radar updating...")
         self.next_lbl.config(text="Next: " + ",  ".join(parts) if parts else "All data paused")
         self.after(1000, self._tick)
+
+    def _check_for_update(self):
+        """Background: ask GitHub for the newest release; offer it if newer than us."""
+        try:
+            r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                             timeout=15, headers={"Accept": "application/vnd.github+json"})
+            if r.status_code != 200:
+                return
+            rel = r.json()
+            tag = rel.get("tag_name", "")
+            if _version_tuple(tag) > _version_tuple(APP_VERSION):
+                self.lq.put(("new_version", (tag, rel.get("html_url") or
+                                             f"https://github.com/{GITHUB_REPO}/releases/latest")))
+        except Exception:                        # offline etc.: just skip the check
+            log.debug("update check failed", exc_info=True)
 
     def _update_now(self):
         self.mrms_wake.set()
@@ -1566,14 +1644,15 @@ def main(argv=None):
     ap.add_argument("--cache", default="mrms_cache")
     ap.add_argument("--top", type=int, default=15)
     a = ap.parse_args(argv)
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    _setup_logging()
     doms = um.DOMAINS if a.domains == "all" else tuple(
         d for d in (x.strip().upper() for x in a.domains.split(",")) if d in um.DOMAINS)
-    cfg = st.Config(cache_dir=Path(a.cache), out_dir=Path(a.out), office=a.office,
+    cfg = st.Config(cache_dir=DATA_DIR / a.cache, out_dir=DATA_DIR / a.out, office=a.office,
                     domains=doms or um.DOMAINS)
     App(cfg, a.loop, a.top).mainloop()
     return 0
 
 
 if __name__ == "__main__":
+    mp.freeze_support()          # required for the worker processes in the exe
     raise SystemExit(main())
